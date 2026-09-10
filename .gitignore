@@ -1,0 +1,26 @@
+﻿# STM32CubeIDE build output
+Debug/
+Release/
+*.elf
+*.bin
+*.hex
+*.map
+*.o
+*.d
+
+# IDE metadata
+.settings/
+.cproject
+.project
+*.launch
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+
+# OS files
+.DS_Store
+Thumbs.db
