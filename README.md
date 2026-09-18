@@ -67,4 +67,4 @@ unit testing, and Python-based test automation.
 ## Author
 
 Mohamed Amine Jazoul
-Electrical Engineering — ENSAM Rabat
+Electrical Engineering Student
