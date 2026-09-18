@@ -1,0 +1,243 @@
+#  Continuous integration for the Automotive Body Control ECU
+#
+#  Every push and pull request answers four questions automatically:
+#
+#    1. Does the firmware still compile and link for the target?
+#    2. Do all 67 unit tests still pass?
+#    3. Does the system test framework itself still work?
+#    4. Does static analysis find anything new?
+#
+#  The point is not the badge. It is that a regression is caught by the machine
+#  minutes after it is introduced, rather than by a person weeks later on a
+#  bench, when the change that caused it is no longer fresh in anyone's memory.
+
+name: CI
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+  workflow_dispatch:        # allow running it by hand from the Actions tab
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  #  Unit tests - the fastest and most informative job, so it runs first.
+  # ---------------------------------------------------------------------------
+  unit-tests:
+    name: Unit tests (host)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show compiler version
+        run: gcc --version
+
+      # -Werror is set in tests/Makefile. In embedded C a warning is usually a
+      # real defect - an implicit conversion that truncates, a comparison that
+      # is always true - and a warning nobody is forced to look at is a warning
+      # nobody looks at.
+      - name: Build and run all suites
+        working-directory: tests
+        run: make
+
+  # ---------------------------------------------------------------------------
+  #  Firmware build - proves the image still compiles and links for ARM, and
+  #  reports its size so flash and RAM growth are visible in every PR.
+  # ---------------------------------------------------------------------------
+  firmware-build:
+    name: Firmware build (ARM)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ARM toolchain
+        uses: carlosperate/arm-none-eabi-gcc-action@v1
+        with:
+          release: '13.2.Rel1'
+
+      - name: Compile and link
+        working-directory: firmware/automotive-body-ecu
+        run: |
+          set -euo pipefail
+
+          INC="-ICore/Inc -Isrc/app -Isrc/services -Isrc/drivers -Isrc/config \
+               -IDrivers/STM32F4xx_HAL_Driver/Inc \
+               -IDrivers/STM32F4xx_HAL_Driver/Inc/Legacy \
+               -IDrivers/BSP/STM32F4xx-Nucleo \
+               -IDrivers/CMSIS/Device/ST/STM32F4xx/Include \
+               -IDrivers/CMSIS/Include"
+
+          FLAGS="-mcpu=cortex-m4 -std=gnu11 -g3 -O0 \
+                 -DUSE_HAL_DRIVER -DSTM32F446xx -DUSE_NUCLEO_64 \
+                 -Wall -Wextra -ffunction-sections -fdata-sections \
+                 --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb"
+
+          mkdir -p build
+
+          for f in Drivers/STM32F4xx_HAL_Driver/Src/*.c \
+                   Drivers/BSP/STM32F4xx-Nucleo/*.c \
+                   Core/Src/*.c src/drivers/*.c src/services/*.c src/app/*.c; do
+            obj="build/$(echo "$f" | tr '/' '_' | sed 's/\.c$/.o/')"
+            arm-none-eabi-gcc $FLAGS $INC -c "$f" -o "$obj"
+          done
+
+          arm-none-eabi-gcc build/*.o Core/Startup/startup_stm32f446retx.s \
+            -o build/automotive-body-ecu.elf \
+            $FLAGS -T STM32F446RETX_FLASH.ld --specs=nosys.specs \
+            -Wl,--gc-sections -static \
+            -Wl,-Map=build/automotive-body-ecu.map \
+            -Wl,--start-group -lc -lm -Wl,--end-group
+
+          arm-none-eabi-objcopy -O binary build/automotive-body-ecu.elf \
+                                          build/automotive-body-ecu.bin
+
+      - name: Report image size
+        working-directory: firmware/automotive-body-ecu
+        run: |
+          echo "### Firmware size" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          arm-none-eabi-size build/automotive-body-ecu.elf | tee -a $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "Flash: 512 KB available | RAM: 128 KB available" >> $GITHUB_STEP_SUMMARY
+
+      # Keeping the built image lets you download and flash the exact binary
+      # that CI tested, rather than rebuilding and hoping it is identical.
+      - name: Upload firmware image
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ github.sha }}
+          path: |
+            firmware/automotive-body-ecu/build/*.elf
+            firmware/automotive-body-ecu/build/*.bin
+            firmware/automotive-body-ecu/build/*.map
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  #  Test framework self-check.
+  #
+  #  The system tests need real hardware, which CI does not have. What CI CAN
+  #  verify is that the framework itself still works, by running the suite
+  #  against a software model of the ECU. A test suite that has never passed is
+  #  an untested assertion.
+  # ---------------------------------------------------------------------------
+  test-framework:
+    name: Test framework self-check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        working-directory: tools/can_tester
+        run: pip install -r requirements.txt
+
+      - name: Verify the CAN encoder against the specification
+        working-directory: tools/can_tester
+        run: |
+          python - <<'PY'
+          from ecu_signals import VehicleStatus, EngineStatus, CrcError, crc8
+
+          # Published check value for CRC-8/SAE-J1850
+          assert crc8(b"123456789") == 0x4B, "CRC does not match the standard"
+
+          # The exact vectors asserted in tests/test_can_signals.c. The C and
+          # Python encoders are written independently from the specification,
+          # so agreement here is real evidence rather than a tautology.
+          assert VehicleStatus(3, True, True, False, False, True,
+                               12600, 0, 0, 7).pack() == \
+                 bytes([0x9B,0x38,0x31,0x00,0x00,0x00,0x07,0x07])
+
+          assert VehicleStatus(4, False, False, False, False, False,
+                               10500, 2, 0x0003, 42).pack() == \
+                 bytes([0x04,0x04,0x29,0x02,0x03,0x00,0x2A,0x44])
+
+          # Signed coolant temperature must survive the +40 offset
+          e = EngineStatus(2500, 875, -30, True, 5)
+          assert EngineStatus.unpack(e.pack()).coolant_temp_c == -30
+
+          # Corruption must be rejected, not silently accepted
+          p = bytearray(e.pack()); p[0] ^= 0x01
+          try:
+              EngineStatus.unpack(bytes(p))
+              raise SystemExit("FAIL: corrupted frame was accepted")
+          except CrcError:
+              pass
+
+          print("CAN encoder matches the specification")
+          PY
+
+      - name: Run the system test suite against the ECU simulator
+        working-directory: tools/can_tester
+        timeout-minutes: 3
+        run: python ecu_simulator.py --self-test
+
+      - name: Confirm an empty bus reports INCONCLUSIVE, not PASSED
+        working-directory: tools/can_tester
+        timeout-minutes: 3
+        run: |
+          # A framework that reports success when nothing was verified is worse
+          # than no framework at all. This asserts the distinction holds.
+          output=$(python run_tests.py --interface virtual 2>&1)
+          echo "$output" | tail -6
+          if echo "$output" | grep -q "INCONCLUSIVE"; then
+            echo "Correct: an empty bus is reported as inconclusive"
+          else
+            echo "FAIL: an empty bus was not reported as inconclusive"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  #  Static analysis. Finds defects a compiler does not look for.
+  # ---------------------------------------------------------------------------
+  static-analysis:
+    name: Static analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cppcheck
+        run: sudo apt-get update && sudo apt-get install -y cppcheck
+
+      # Only our own code is analysed. ST's HAL is third-party and generates
+      # thousands of style findings that would bury anything real.
+      - name: Analyse application code
+        run: |
+          cppcheck \
+            --enable=warning,style,performance,portability \
+            --inline-suppr \
+            --error-exitcode=1 \
+            --suppress=missingIncludeSystem \
+            --suppress=unusedFunction \
+            --std=c11 \
+            -I firmware/automotive-body-ecu/src/config \
+            -I firmware/automotive-body-ecu/src/drivers \
+            -I firmware/automotive-body-ecu/src/services \
+            -I firmware/automotive-body-ecu/src/app \
+            firmware/automotive-body-ecu/src/ \
+            tests/
+
+  # ---------------------------------------------------------------------------
+  #  Single gate for branch protection: one check to require, not four.
+  # ---------------------------------------------------------------------------
+  all-checks:
+    name: All checks passed
+    runs-on: ubuntu-latest
+    needs: [unit-tests, firmware-build, test-framework, static-analysis]
+    if: always()
+    steps:
+      - name: Verify every job succeeded
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ] || \
+             [ "${{ contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "One or more checks failed"
+            exit 1
+          fi
+          echo "All checks passed"

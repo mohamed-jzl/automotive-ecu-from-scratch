@@ -1,0 +1,20 @@
+# Python dependencies for the ECU test framework
+#
+#   pip install -r requirements.txt
+#
+# python-can is the standard Python CAN abstraction. It supports every adapter
+# this project might meet - SLCAN serial dongles, PEAK PCAN, Kvaser, Vector,
+# Linux SocketCAN - behind one API, plus a virtual backend that needs no
+# hardware at all.
+#
+# Versions are pinned to a minimum rather than exactly: 4.x has a stable API,
+# and pinning exactly would force the whole project onto one release for no
+# benefit in a project this size. A production test bench pins exact versions,
+# because a test environment that changes underneath you invalidates every
+# result it has ever produced.
+
+python-can>=4.3.0
+
+# No other runtime dependency. The HTML report is generated with the standard
+# library alone, so the framework stays installable on a locked-down machine -
+# which is what a real test bench usually is.

@@ -1,26 +1,57 @@
-﻿# STM32CubeIDE build output
-Debug/
-Release/
+# =============================================================================
+#  Ignore build OUTPUT, keep build CONFIGURATION.
+#
+#  The distinction matters. Anyone cloning this repository must be able to
+#  import the project into STM32CubeIDE and build it, which needs .project,
+#  .cproject and the .ioc. Those are configuration and ARE committed.
+#
+#  Compiled objects and images are reproducible from source, differ between
+#  machines, and would churn on every build - so they are not.
+# =============================================================================
+
+# --- STM32CubeIDE build output -----------------------------------------------
+firmware/**/Debug/
+firmware/**/Release/
 *.elf
 *.bin
 *.hex
 *.map
+*.list
 *.o
 *.d
+*.su
+*.cyclo
 
-# IDE metadata
+# --- Unit test build output --------------------------------------------------
+tests/build/
+
+# --- Test reports ------------------------------------------------------------
+# Generated per run and specific to one bench. Archive them deliberately as
+# release artefacts rather than committing every local run.
+*.html
+!docs/**/*.html
+
+# --- Editor and IDE workspace state ------------------------------------------
+# .settings/ holds per-machine paths and indexer state, not project config.
 .settings/
-.cproject
-.project
 *.launch
+.vscode/
+.idea/
 
-# Python
+# --- CubeMX backups ----------------------------------------------------------
+*.ioc.bak
+*.bak
+
+# --- Python ------------------------------------------------------------------
 __pycache__/
-*.pyc
-*.pyo
-.env
+*.py[cod]
+.venv/
 venv/
+env/
+.pytest_cache/
+*.egg-info/
 
-# OS files
+# --- OS ----------------------------------------------------------------------
 .DS_Store
 Thumbs.db
+desktop.ini
