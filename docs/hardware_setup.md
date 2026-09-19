@@ -160,11 +160,12 @@ Expected output at reset:
 ```
 ===========================================
   Automotive Body Control ECU
-[          8][INFO ] Firmware v0.1.0  target STM32F446RE
+[          8][INFO ] Firmware v0.2.0  target STM32F446RE
 [          9][INFO ] System clock 84000000 Hz
 [         10][INFO ] Reset cause: power-on or manual reset
 ===========================================
-[         12][INFO ] Body control initialised - 4 tasks registered
+[         14][INFO ] Diagnostics ready - UDS on 0x7E0/0x7E8, NVM 0% used
+[         15][INFO ] Body control initialised - 5 tasks registered
 [       1420][INFO ] State: OFF -> ACC  (event IGN_SHORT)
 [       2110][INFO ] State: ACC -> ON  (event IGN_SHORT)
 [       3350][INFO ] State: ON -> RUN  (event IGN_LONG)
@@ -215,7 +216,31 @@ them in sequence is much faster than debugging the whole bench at once.
 11. **CAN transmits** — with an adapter attached,
     `python run_tests.py --interface slcan --channel COM5` reports passes.
 
-## 7. Troubleshooting
+## 7. Diagnostics (v0.2)
+
+With a USB-CAN adapter on the bus, the ECU can be diagnosed like a production
+module. The same commands work against the SIL target (`--sil`) with no
+hardware at all.
+
+```
+cd tools/can_tester
+python diag_tool.py --interface slcan --channel COM5 info        # identification + live data
+python diag_tool.py --interface slcan --channel COM5 dtc         # stored DTCs with freeze frames
+python diag_tool.py --interface slcan --channel COM5 lamp-test   # all lamps on for 3 s
+python run_diag_tests.py --interface slcan --channel COM5        # the 24 diagnostic system tests
+```
+
+**Seeing a real DTC.** Turn the battery potentiometer below ~11 V for a few
+seconds, then back up. The status LED flashes at 5 Hz while the fault is
+active; afterwards `dtc` shows `P0562-00` with status `0x2E` (not failing now,
+but confirmed) and a freeze frame holding the voltage it dropped to. Press the
+reset button: the DTC is still there, because it is stored in flash.
+
+**First boot after flashing v0.2** takes up to ~2 s longer than usual while the
+NVM sectors are prepared (erased). That happens before the watchdog starts, and
+only when the sectors need it.
+
+## 8. Troubleshooting
 
 | Symptom | Most likely cause |
 |---|---|
@@ -228,6 +253,10 @@ them in sequence is much faster than debugging the whole bench at once.
 | Voltage reading always full scale | Divider shorted, or ADC pin tied to 3.3 V |
 | No CAN frames | Transceiver unpowered, TX/RX swapped, or missing termination |
 | CAN works briefly then stops | Bus-off from a bit rate mismatch, or a missing second node to acknowledge frames |
+| Diagnostic tester times out | Adapter not at 500 kbit/s, or tester using 0x7E0/0x7E8 swapped |
+| `7F 27 37` on every seed request | Security lockout after 3 wrong keys - wait 10 s |
+| `7F xx 7F` | Service needs the extended session: send `10 03` first |
+| DTCs lost after reset | NVM failed to initialise - look for "NVM unavailable" in the boot log |
 
 **The single most common CAN mistake:** a CAN transmitter needs at least one
 other node to acknowledge each frame. A single node alone on a bus will

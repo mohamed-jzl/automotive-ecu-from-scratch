@@ -5,6 +5,9 @@ done differently. Written because the reasoning behind a choice is worth more
 six months later than the choice itself — and because a project that reports
 only its successes teaches nobody anything.
 
+Sections 1-4 cover v0.1 (the body control functions). Section 5 covers v0.2
+(UDS diagnostics).
+
 ---
 
 ## 1. Problems hit during development
@@ -201,7 +204,7 @@ disagreement between them meaningful.
 |---|---|---|---|
 | **UART logging** | Blocking transmit, ~87 µs per character | Ring buffer + DMA | Blocking is simpler to reason about while learning. It is also a real hazard: a 50-character line costs 4.3 ms of a 10 ms budget, so logging inside a fast task causes the deadline miss it was added to diagnose. |
 | **Timing resolution** | 1 ms, from `HAL_GetTick()` | DWT cycle counter, ~12 ns at 84 MHz | Tasks taking 0.4 ms and 1.4 ms are currently indistinguishable, which makes the reported worst-case execution time far coarser than the analysis deserves. |
-| **CAN reception** | Polled every 100 ms | Interrupt-driven | Adequate at this bus load. On a loaded bus the 3-message hardware FIFO could overrun between polls, silently dropping frames. |
+| **CAN reception** | ~~Polled every 100 ms~~ | Interrupt-driven | **Done in v0.2** - a diagnostic tester's multi-frame request made the change necessary rather than optional. See 5.2. |
 | **Watchdog timeout** | Nominal 500 ms, LSI ±50% | Measure LSI against a precise clock and compensate | The true timeout lies between roughly 330 ms and 1 s. Fine for a teaching project, unacceptable for a safety function. |
 | **CAN encode/decode** | Hand-written in C and Python | Generated from a DBC file with `cantools` | Writing it by hand makes the bit packing visible, which is the educational point. A production project generates both sides from one source so they cannot diverge. |
 | **Test framework** | Custom `unity_min.h` | Vendored ThrowTheSwitch Unity | The API is deliberately identical, so migration is one submodule and a Makefile line. Keeping it small avoided burying the tests under 2000 lines of third-party source. |
@@ -230,3 +233,106 @@ scope exclusions and known limitations. This is more convincing than claiming
 completeness, and it is exactly what a reviewer looks for: an engineer who
 knows the boundaries of their own work is far easier to trust than one whose
 work appears to have none.
+
+---
+
+## 5. Version 0.2 — UDS diagnostics
+
+### 5.1 Running the tests for the first time found a defect in v0.1
+
+**Symptom.** v0.1 shipped 67 unit tests that had only ever been *compiled*,
+never run, because the development PC had no host C compiler. When v0.2
+brought one in (clang, via `pip install ziglang`), `test_can_signals.c` failed
+to build: an uninitialised struct was passed to a function by pointer.
+
+**Cause.** GCC does not warn about this case; clang does
+(`-Wuninitialized-const-pointer`). It was harmless in practice - the callee
+returned on its other, NULL, argument before reading the struct - but it is
+undefined behaviour, and `-Werror` correctly refused it.
+
+**Lesson.** Tests that have never been executed are not evidence of anything,
+however carefully written. And two compilers see more than one: CI now uses
+GCC while local runs use clang, and every host-compiled file is checked with
+both before a push.
+
+### 5.2 The IDE build could not have worked
+
+**Symptom.** While adding `src/diag/` to the CubeIDE project, the `.cproject`
+turned out to list only `../src/drivers` as an include path. `src/app`,
+`src/services` and `src/config` - all of v0.1's application code - were
+missing from both the Debug and Release configurations.
+
+**Cause.** Every v0.1 build had been done from the command line with explicit
+`-I` flags, which hid the problem completely. Importing the project into
+CubeIDE and pressing Ctrl+B would have failed on the first `#include`.
+
+**Lesson.** Build the way your users build. A README that says "import into
+CubeIDE and press Ctrl+B" is a claim, and the only way to know it is true is
+to do exactly that.
+
+### 5.3 CI had never run
+
+The v0.1 commit existed locally but had never been pushed, so the CI pipeline
+described in the README had not executed once. A pipeline that is never
+triggered protects nothing, and a green badge on an old commit proves nothing
+about the current one.
+
+### 5.4 A failing test that was right about the code and wrong about itself
+
+**Symptom.** Two DTC aging tests failed: after "40 clean cycles" the DTC was
+still confirmed, and an aging counter read 29 where 30 was expected.
+
+**Cause.** The code was correct and the tests were not. The operation cycle in
+which a DTC *fails* is not a clean cycle. The first `StartOperationCycle()`
+after a failure closes that failing cycle without aging; only later cycles
+count.
+
+**Lesson.** When a test fails, the question is "which of the two is wrong?",
+not "how do I make it pass?". Re-reading the standard settled it in a minute.
+Changing the code to match the test would have introduced a real defect in
+order to silence a correct alarm.
+
+### 5.5 The ECU was right; the test harness leaked state
+
+**Symptom.** In the first full SIL run, 23 of 24 diagnostic tests passed. The
+lamp self-test was refused with NRC `0x22` conditionsNotCorrect.
+
+**Cause.** An earlier test had set the simulated vehicle state to RUN, and the
+lamp test is - correctly - forbidden while the engine runs. The SIL power
+cycle reset the diagnostic stack but not the simulated application, so one
+test's state leaked into the next. On a real ECU a reset always returns to OFF.
+
+**Lesson.** Test isolation is part of the test, not a convenience. It also
+illustrates why the ECU refusing was a *good* result: a stack that had allowed
+the routine would have hidden the harness bug and shipped a safety defect.
+
+### 5.6 Flash erase time shaped the whole persistence design
+
+Erasing a 128 KB sector blocks the CPU for 1-2 s. The watchdog times out after
+~0.5 s. The obvious design - erase, then rewrite the DTC table - therefore
+resets the ECU in the middle of every save.
+
+The append-only store follows directly from that single number: records are
+appended (microseconds per word, no erase), two sectors alternate, and erasing
+happens only at start-up before the watchdog is armed. Understanding the
+physical constraint first made the design almost obvious; starting from the
+data structure would have led to a design that works on the bench until the
+day the timing lines up badly.
+
+### 5.7 A deterministic generator makes replay possible
+
+The first seed/key version seeded its random generator once at boot, from the
+chip's unique ID and the boot time. Both are the same on every power-up, so
+the first seed after every boot was identical - and a key recorded once could
+be replayed forever. The fix mixes the millisecond timestamp of each seed
+request into the generator. It is still not cryptography, and the
+documentation says so, but it removes an attack that needed no skill at all.
+
+### 5.8 Testing against someone else's implementation
+
+The UDS tester is not hand-written: it is udsoncan and can-isotp, maintained
+by other people and used widely. That was deliberate. A client written by the
+same person as the server tends to share its misreadings of the standard, so
+the two agree and every test passes. When an independent implementation
+accepts our segmented responses, our NRCs and our flow control, that is
+evidence the ECU follows the standard - not merely that it agrees with itself.

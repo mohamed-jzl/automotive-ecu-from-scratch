@@ -41,11 +41,20 @@ _estack = ORIGIN(RAM) + LENGTH(RAM); /* end of "RAM" Ram type memory */
 _Min_Heap_Size = 0x200; /* required amount of heap */
 _Min_Stack_Size = 0x400; /* required amount of stack */
 
-/* Memories definition */
+/* Memories definition
+ *
+ * FLASH is deliberately limited to 256K (sectors 0-5) instead of the full 512K.
+ * Sectors 6 and 7 (0x08040000 - 0x0807FFFF, 2 x 128 KB) are reserved for the
+ * non-volatile store that keeps DTCs and the VIN across resets - see
+ * src/services/nvm_store.c and ECU_NVM_* in src/config/ecu_config.h.
+ *
+ * Without this limit the linker could place code inside the NVM sectors, and
+ * the first DTC write would erase part of the running firmware.
+ */
 MEMORY
 {
   RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 128K
-  FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 512K
+  FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 256K
 }
 
 /* Sections */

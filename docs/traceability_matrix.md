@@ -27,6 +27,7 @@ re-run?* Without the table, the honest answer is "all of them".
 | **U** | Unit test — host PC, automated |
 | **S** | System test — over CAN against the real ECU, automated |
 | **I** | Integration test — manual, on the bench |
+| **SIL** | Diagnostic system test — production C stack on a PC, driven by udsoncan (`run_diag_tests.py --sil`); the same tests run on hardware |
 
 ---
 
@@ -119,16 +120,62 @@ re-run?* Without the table, the honest answer is "all of them".
 | REQ-082 | Log transitions, not steady state | `body_control.c:update_fault`, `fault_manager.c:Update` return value | `test_update_reports_the_latching_transition`, `test_repeated_fault_set_does_not_report_a_change` | U |
 | REQ-083 | Status LED encodes the operating mode | `body_control.c:update_status_led` | IT-02 | I |
 
+### UDS diagnostics (v0.2)
+
+Unit test suites: `test_isotp` (ISO-TP), `test_uds_server` (UDS),
+`test_uds_security`, `test_dtc_manager`, `test_nvm_store`.
+System tests: `DG-0xx` in `tools/can_tester/diag_test_cases.py`.
+
+| Req | Requirement | Implementation | Verified by | Level |
+|---|---|---|---|---|
+| REQ-100 | Physical `7E0`, functional `7DF`, response `7E8` | `ecu_config.h:ECU_DIAG_CAN_ID_*`, `isotp.c:IsoTp_OnFrame` | `test_foreign_identifier_is_not_consumed`, every DG test | U, SIL |
+| REQ-101 | NRC `11` / `12` / `13` | `uds_server.c:UdsServer_ProcessRequest` + handlers | `test_unknown_service_is_rejected`, `test_programming_session_is_not_supported`, DG-009 | U, SIL |
+| REQ-102 | ISO 14229 NRC order | `uds_server.c:UdsServer_ProcessRequest` | `test_service_in_wrong_session_is_rejected`, `test_write_unknown_did_is_out_of_range` | U |
+| REQ-103 | Functional suppression, suppress bit | `uds_server.c:negative_response` | `test_functional_not_supported_errors_are_silent`, `test_suppress_bit_never_hides_an_error`, DG-011 | U, SIL |
+| REQ-104 | Extended-only services refused with `7F` | `uds_server.c:SERVICE_TABLE` | `test_write_not_allowed_in_default_session`, DG-010 | U, SIL |
+| REQ-110 | Default session after reset | `uds_server.c:UdsServer_Init` | `test_starts_in_default_session_locked`, DG-001, DG-016 | U, SIL |
+| REQ-111 | P2 = 50 ms, P2\* = 5000 ms reported | `uds_server.c:handle_session_control` | `test_extended_session_response_carries_timing`, DG-002 | U, SIL |
+| REQ-112 | S3 fallback and re-lock | `uds_server.c:UdsServer_Poll` | `test_s3_timeout_returns_to_default_session`, DG-003 | U, SIL |
+| REQ-113 | TesterPresent restarts S3 | `uds_server.c:UdsServer_ProcessRequest` | `test_tester_present_keeps_the_session_alive`, DG-004 | U, SIL |
+| REQ-120 | Identification DIDs | `diag_app.c:DID_TABLE` | DG-005 | SIL |
+| REQ-121 | Live data DIDs | `diag_app.c:DID_TABLE` | DG-006 | SIL |
+| REQ-122 | No supported DID → `31` | `uds_server.c:handle_read_did` | `test_read_only_unsupported_dids_is_out_of_range`, DG-008 | U, SIL |
+| REQ-123 | VIN write needs extended + unlock | `uds_server.c:handle_write_did` | `test_write_requires_security`, DG-012, DG-014 | U, SIL |
+| REQ-124 | VIN validated (ISO 3779) | `diag_app.c:write_vin` | DG-015 | SIL |
+| REQ-130 | Correct key unlocks | `uds_server.c:handle_security_access`, `uds_security.c` | `test_correct_key_unlocks`, `test_known_key_vectors`, DG-013 | U, SIL |
+| REQ-131 | Protected services → `33` | `uds_server.c:handle_write_did`, `handle_routine_control` | `test_protected_routine_needs_security`, DG-012, DG-023 | U, SIL |
+| REQ-132 | 3 wrong keys → `36`, then `37` for 10 s | `uds_server.c:handle_security_access` | `test_three_wrong_keys_trigger_a_lockout`, DG-024 | U, SIL |
+| REQ-133 | Seed non-zero, single use, zero when unlocked | `uds_security.c:UdsSecurity_NextSeed`, `uds_server.c` | `test_generator_never_returns_zero`, `test_wrong_key_is_rejected_and_consumes_the_seed`, `test_seed_is_zero_when_already_unlocked`, DG-013 | U, SIL |
+| REQ-140 | Respond before resetting | `diag_manager.c:DiagManager_Poll` | `test_hard_reset_is_acknowledged_then_requested`, DG-016 | U, SIL |
+| REQ-141 | VIN and DTCs survive reset | `diag_manager.c:save_if_needed`, `restore_from_nvm` | DG-016, DG-021 | SIL |
+| REQ-142 | Power loss during write is safe | `nvm_store.c:write_slot` (magic written last, CRC-32) | `test_torn_write_keeps_the_previous_record`, `test_corrupted_record_is_ignored` | U |
+| REQ-143 | No erase after watchdog armed | `nvm_store.c:NvmStore_Write` (never erases), `main.c` init order | `test_full_region_switches_without_erasing`, `test_both_regions_full_reports_full` | U |
+| REQ-150 | Status byte per ISO 14229 Annex D | `dtc_manager.c:DtcManager_ReportResult` | `test_failure_sets_the_expected_bits`, `test_pass_after_failure_keeps_the_history`, DG-017, DG-019 | U, SIL |
+| REQ-151 | Freeze frame at first confirmation | `dtc_manager.c`, `uds_server.c:handle_read_dtc` | `test_snapshot_is_captured_at_first_failure_only`, `test_snapshot_record`, DG-018 | U, SIL |
+| REQ-152 | Clear all or one DTC | `dtc_manager.c:DtcManager_Clear` | `test_clear_all_restores_initial_status`, `test_clear_single_dtc_leaves_the_others`, DG-020 | U, SIL |
+| REQ-153 | ControlDTCSetting, restored in default | `uds_server.c:enter_session`, `dtc_manager.c` | `test_dtc_setting_off_freezes_dtcs_until_default_session`, DG-022 | U, SIL |
+| REQ-154 | Aging after 40 clean cycles | `dtc_manager.c:DtcManager_StartOperationCycle` | `test_confirmed_dtc_ages_out_after_the_threshold`, `test_failing_again_restarts_aging` | U |
+| REQ-155 | Operation cycle starts at OFF → ACC | `body_control.c:task_10ms` | IT-14 | I |
+| REQ-160 | ISO-TP segmentation, FC, timeouts | `isotp.c` | 25 tests in `test_isotp`, DG-007, DG-014 | U, SIL |
+| REQ-161 | Interrupt-driven 32-frame RX queue | `can_driver.c:HAL_CAN_RxFifo0MsgPendingCallback` | IT-15 | I |
+| REQ-170 | Lamp self-test routine | `diag_app.c:lamp_test_*`, `body_control.c:task_50ms` | `test_routine_start_and_results`, DG-023, IT-16 | U, SIL, I |
+
 ---
 
 ## Coverage summary
 
 | | Count |
 |---|---|
-| Requirements defined | 36 |
-| Covered by automated tests (U or S) | 27 (75%) |
-| Covered by manual bench tests only (I) | 6 (17%) |
-| Covered by code review only | 3 (8%) |
+| Requirements defined | 67 |
+| Covered by automated tests (U, S or SIL) | 56 (84%) |
+| Covered by manual bench tests only (I) | 8 (12%) |
+| Covered by code review only | 3 (4%) |
+
+The two new bench-only requirements are both about *integration*: REQ-155
+depends on the real state machine driving the DTC manager, and REQ-161 on a
+real interrupt firing under real bus load. Neither exists in the SIL build,
+which deliberately contains only the diagnostic stack. That boundary is
+stated here so nobody mistakes the SIL results for more than they prove.
 
 ### The three requirements with no test
 

@@ -27,7 +27,7 @@
 /* ========================================================================= */
 
 #define ECU_FW_VERSION_MAJOR            0U
-#define ECU_FW_VERSION_MINOR            1U
+#define ECU_FW_VERSION_MINOR            2U
 #define ECU_FW_VERSION_PATCH            0U
 
 #define ECU_NAME                        "BodyControlECU"
@@ -45,9 +45,10 @@
 /* Scheduler - cooperative time-triggered task periods                       */
 /* ========================================================================= */
 
-/* The main loop runs these four tasks at fixed periods. Periods are chosen
+/* The main loop runs these tasks at fixed periods. Periods are chosen
  * as multiples of each other so the schedule is easy to reason about and
  * jitter stays bounded. */
+#define ECU_TASK_PERIOD_5MS             5U     /* CAN reception + diagnostics    */
 #define ECU_TASK_PERIOD_10MS            10U    /* input sampling + state machine */
 #define ECU_TASK_PERIOD_50MS            50U    /* output actuation (indicators)  */
 #define ECU_TASK_PERIOD_100MS           100U   /* CAN vehicle status transmit    */
@@ -244,5 +245,126 @@
 #define ECU_WATCHDOG_PRESCALER_DIV      32UL
 #define ECU_WATCHDOG_RELOAD             ((ECU_WATCHDOG_TIMEOUT_MS * ECU_WATCHDOG_LSI_HZ) \
                                          / (ECU_WATCHDOG_PRESCALER_DIV * 1000UL))
+
+/* ========================================================================= */
+/* CAN reception buffer                                                      */
+/* ========================================================================= */
+
+/* Frames are moved out of the 3-message hardware FIFO by an interrupt and
+ * queued here until the 5 ms task processes them. 32 frames is ~2 ms of a
+ * fully loaded 500 kbit/s bus - far more than a diagnostic tester can produce
+ * given the STmin we ask it to respect. Must be a power of two. */
+#define ECU_CAN_RX_QUEUE_SIZE           32U
+
+/* ========================================================================= */
+/* Diagnostics - addressing (ISO 15765-4 conventions for 11-bit IDs)         */
+/* ========================================================================= */
+
+/* Physical request: sent by the tester to THIS ECU only.
+ * Functional request: broadcast to every ECU on the bus at once.
+ * Response: always sent from this ECU's own response identifier.
+ * 0x7E0/0x7E8 is the pair conventionally used by the first ECU on a bus. */
+#define ECU_DIAG_CAN_ID_PHYSICAL        0x7E0U
+#define ECU_DIAG_CAN_ID_FUNCTIONAL      0x7DFU
+#define ECU_DIAG_CAN_ID_RESPONSE        0x7E8U
+
+/* ========================================================================= */
+/* ISO-TP (ISO 15765-2) - transport of UDS messages longer than 7 bytes      */
+/* ========================================================================= */
+
+/* Largest UDS message we accept or send. ISO-TP allows up to 4095 bytes;
+ * our longest real message (a full DTC report) is under 40. Requests longer
+ * than this are refused with a flow-control OVERFLOW frame, not truncated. */
+#define ECU_ISOTP_BUFFER_SIZE           256U
+
+/* Unused bytes of a frame are filled with this value. Always sending 8-byte
+ * frames keeps the bit length constant, which simplifies bus-load analysis;
+ * 0xCC is a common choice because its alternating bits limit bit stuffing. */
+#define ECU_ISOTP_PADDING_BYTE          0xCCU
+
+/* Parameters we send in our Flow Control frame when receiving a long request:
+ *   Block size 0 = "send everything, no further flow control needed".
+ *   STmin 5 ms   = minimum gap the tester must leave between consecutive
+ *                  frames, so our 5 ms task can keep up without the receive
+ *                  queue overflowing. */
+#define ECU_ISOTP_BLOCK_SIZE            0U
+#define ECU_ISOTP_ST_MIN_MS             5U
+
+/* Protocol timeouts (ISO 15765-2 section 9.8). If the next expected frame does
+ * not arrive in time, the transfer is abandoned rather than waited on forever.
+ *   N_Cr: waiting for the next Consecutive Frame when receiving.
+ *   N_Bs: waiting for a Flow Control frame when sending. */
+#define ECU_ISOTP_TIMEOUT_N_CR_MS       1000U
+#define ECU_ISOTP_TIMEOUT_N_BS_MS       1000U
+
+/* A receiver may answer "WAIT" instead of "continue". Limiting how many WAITs
+ * we accept stops a faulty tester from stalling our transmitter forever. */
+#define ECU_ISOTP_MAX_WAIT_FRAMES       10U
+
+/* ========================================================================= */
+/* UDS (ISO 14229-1) - timing                                                */
+/* ========================================================================= */
+
+/* P2server: maximum time between receiving a request and starting the reply.
+ * P2*server: extended limit after a "response pending" (NRC 0x78).
+ * Both values are reported to the tester in the DiagnosticSessionControl
+ * response, so the tester knows how long to wait. */
+#define ECU_UDS_P2_SERVER_MS            50U
+#define ECU_UDS_P2_STAR_SERVER_MS       5000U
+
+/* S3server: a non-default session falls back to the default session if no
+ * request arrives within this window. This is why testers send
+ * TesterPresent (0x3E) periodically: an abandoned tester must never leave an
+ * ECU unlocked in an extended session. */
+#define ECU_UDS_S3_SERVER_MS            5000U
+
+/* ========================================================================= */
+/* UDS - security access (service 0x27)                                      */
+/* ========================================================================= */
+
+/* After this many wrong keys the ECU refuses new seeds for a time delay.
+ * Without it, a 32-bit key could be brute-forced by trying keys in a loop. */
+#define ECU_UDS_SECURITY_MAX_ATTEMPTS   3U
+#define ECU_UDS_SECURITY_LOCKOUT_MS     10000U
+
+/* ========================================================================= */
+/* DTC management                                                            */
+/* ========================================================================= */
+
+/* A confirmed DTC that does not fail again for this many operation cycles
+ * (ignition cycles here) is considered healed and is removed from memory.
+ * This is called DTC aging. 40 is a typical OEM value. */
+#define ECU_DTC_AGING_THRESHOLD         40U
+
+/* Maximum number of DTCs the manager can hold. */
+#define ECU_DTC_MAX_COUNT               16U
+
+/* ========================================================================= */
+/* Non-volatile memory (emulated EEPROM in flash)                            */
+/* ========================================================================= */
+
+/* Two 128 KB flash sectors used in ping-pong, excluded from the code region by
+ * the linker script. Flash can only be erased a whole sector at a time, and
+ * erasing 128 KB blocks the CPU for 1-2 seconds - longer than the watchdog
+ * timeout. The store is designed so that erasing only ever happens at startup,
+ * before the watchdog is armed. See nvm_store.h for the full reasoning. */
+#define ECU_NVM_REGION_A_ADDRESS        0x08040000UL   /* sector 6 */
+#define ECU_NVM_REGION_B_ADDRESS        0x08060000UL   /* sector 7 */
+#define ECU_NVM_REGION_SIZE             (128UL * 1024UL)
+
+/* At startup, if the active region is fuller than this, the latest record is
+ * migrated to the other region and the old one is erased. */
+#define ECU_NVM_COMPACT_THRESHOLD_PCT   75U
+
+/* Minimum interval between two flash writes. Flash cells survive about 10 000
+ * erase cycles; rate-limiting protects them from a fault that flickers. */
+#define ECU_NVM_MIN_WRITE_INTERVAL_MS   1000U
+
+/* ========================================================================= */
+/* Diagnostic routines                                                       */
+/* ========================================================================= */
+
+/* Duration of the lamp self-test started through RoutineControl (0x31). */
+#define ECU_LAMP_TEST_DURATION_MS       3000U
 
 #endif /* CONFIG_ECU_CONFIG_H */

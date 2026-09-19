@@ -390,7 +390,7 @@ static void test_alive_counter_is_carried_through_unchanged(void)
 static void test_null_arguments_are_handled_safely(void)
 {
     uint8_t            payload[8] = {0};
-    CanVehicleStatus_t status;
+    CanVehicleStatus_t status     = {0};
 
     /* None of these may dereference NULL. */
     CanSignals_PackVehicleStatus(NULL, payload);

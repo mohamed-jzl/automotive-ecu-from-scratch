@@ -68,6 +68,22 @@ Only modules that are **pure** — no HAL, no register access, no time source:
 | `test_fault_manager` | `fault_manager.c` | 16 |
 | `test_can_signals` | `can_signals.c` | 18 |
 | `test_adc_conversion` | `AdcDriver_RawToBatteryMv` | 8 |
+| `test_isotp` | `isotp.c` (ISO 15765-2) | 25 |
+| `test_uds_server` | `uds_server.c` + `dtc_manager.c` + `uds_security.c` | 54 |
+| `test_uds_security` | `uds_security.c` | 6 |
+| `test_dtc_manager` | `dtc_manager.c` | 22 |
+| `test_nvm_store` | `nvm_store.c` | 12 |
+| **Total** | | **186** |
+
+On a machine without `make` (typically Windows), `python tools/run_unit_tests.py`
+builds and runs the same suites with the same flags; with no compiler at all,
+`pip install ziglang` provides one.
+
+**Simulating hardware that misbehaves.** `test_nvm_store` runs against a RAM
+array that follows real flash rules (programming can only clear bits) plus a
+"power budget" that fails the N-th write, which is how a power cut halfway
+through a record is reproduced on every run. `test_isotp` feeds lost frames,
+wrong sequence numbers and a mailbox that refuses frames.
 
 The tests link the **real production source**, never a copy. A test that
 passes against a duplicated implementation proves nothing about the shipped
@@ -138,6 +154,9 @@ light.
 | IT-11 | Undervoltage matures, not instant | REQ-032 | Sweep down, time the latch (~1.5 s) |
 | IT-12 | Fault clears more slowly than it set | REQ-033 | Sweep back up, time the clear (~2.5 s) |
 | IT-13 | Watchdog resets a hung ECU | REQ-070, REQ-072 | Temporarily add `while(1);` to a task; the banner must report a watchdog reset |
+| IT-14 | Ignition-on starts a DTC operation cycle | REQ-155 | Provoke undervoltage, restore it, cycle OFF→ACC; `diag_tool.py dtc` must show bit 6 (TNCTOC) set and bit 1 cleared |
+| IT-15 | No CAN frame lost during diagnostics | REQ-161 | Run `run_diag_tests.py` on hardware; every multi-frame test (DG-007, DG-014) must pass |
+| IT-16 | Lamp self-test lights the lamps | REQ-170 | `diag_tool.py lamp-test`; all four exterior LEDs on for 3 s |
 
 > IT-13 is the only test that deliberately breaks the firmware. It is the only
 > way to prove the watchdog works: a watchdog that has never fired is an
@@ -222,6 +241,44 @@ hardware-timestamping interface or a CAN analyser. Knowing the limits of your
 instruments is part of being a test engineer, so the measured jitter is
 reported alongside every timing result rather than hidden.
 
+### 5.6 Diagnostic system tests - SIL and HIL
+
+**Location:** `tools/can_tester/diag_test_cases.py` (DG-001 to DG-024)
+**Tester:** udsoncan + can-isotp — independent open-source implementations
+**Commands:**
+
+```
+python run_diag_tests.py --sil                                  # no hardware
+python run_diag_tests.py --interface slcan --channel COM5       # real ECU
+```
+
+The same 24 tests run against two targets:
+
+| | SIL (software-in-the-loop) | HIL (hardware-in-the-loop) |
+|---|---|---|
+| Code under test | production `src/diag/*.c` + `nvm_store.c`, compiled for the PC | the full firmware on the STM32 |
+| Bus | python-can virtual bus | real CAN, via a USB adapter |
+| Flash | RAM with flash semantics | real sectors 6-7 |
+| Fault injection | from Python, on demand | turn the battery potentiometer |
+| Proves | the protocol logic interoperates with an independent tester | the integrated ECU meets its timing and hardware requirements |
+
+**Why an independent tester matters.** A client written by the same person
+as the ECU tends to share its misunderstandings of the standard, so the two
+agree and the tests pass. udsoncan and can-isotp were written by others
+against ISO 14229 and ISO 15765. When they accept this ECU's segmented
+responses and NRCs, that is evidence of interoperability, not of
+self-consistency.
+
+**Test isolation.** On SIL every test starts from a factory-fresh ECU (power
+cycle, erased flash), so no result depends on which test ran before. DG-024
+(security lockout) runs last on hardware, where a power cycle between tests is
+not automatic, because it blocks unlocking for 10 s.
+
+**What SIL does not prove.** The SIL build contains the diagnostic stack only:
+no scheduler, no interrupt, no real flash timing. REQ-155 and REQ-161 are
+therefore verified on the bench (IT-14, IT-15), and diagnostic timing (P2) is a
+HIL-only measurement.
+
 ---
 
 ## 6. Continuous integration
@@ -231,9 +288,10 @@ reported alongside every timing result rather than hidden.
 | Job | What it proves |
 |---|---|
 | Firmware build | The ECU image compiles and links for ARM, with size reported |
-| Unit tests | All 67 tests pass, compiled with `-Wall -Wextra -Werror` |
+| Unit tests | All 186 tests pass, compiled with `-Wall -Wextra -Werror` |
 | Framework self-test | The Python suite passes against the simulator |
-| Static analysis | `cppcheck` finds no defects in application code |
+| UDS diagnostics (SIL) | 24 diagnostic tests pass against the production C stack; HTML report archived |
+| Static analysis | `cppcheck` finds no defects (warning, performance, portability); style findings reported, not blocking |
 
 `-Werror` means a compiler warning fails the build. In embedded C a warning is
 usually a real defect — an implicit conversion that truncates, a comparison

@@ -38,6 +38,7 @@
 #define APP_BODY_CONTROL_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 /**
  * @brief Initialise every layer of the ECU and register the periodic tasks.
@@ -49,15 +50,24 @@
  *   4. Application state.
  *   5. Scheduler tasks last - nothing runs until everything exists.
  *
+ * @param  was_watchdog_reset  Reset cause, read by main() before anything could
+ *                             clear it. Printed in the startup banner, which
+ *                             comes first in the log so every later line is
+ *                             read in the context of how the ECU started.
  * @return true if every subsystem initialised successfully. A false return
  *         means the ECU is running degraded; the log identifies which
  *         subsystem failed.
  */
-bool BodyControl_Init(void);
+bool BodyControl_Init(bool was_watchdog_reset);
 
 /**
  * @brief Report whether initialisation completed without any subsystem failing.
  */
 bool BodyControl_IsHealthy(void);
+
+/**
+ * @brief Latest battery measurement in millivolts (DID 0x0100, DTC snapshots).
+ */
+uint32_t BodyControl_GetBatteryMv(void);
 
 #endif /* APP_BODY_CONTROL_H */

@@ -11,9 +11,11 @@
 
 #include "body_control.h"
 
+#include "diag_app.h"
 #include "vehicle_state_machine.h"
 
 #include "can_manager.h"
+#include "diag_manager.h"
 #include "fault_manager.h"
 #include "logger.h"
 #include "scheduler.h"
@@ -158,9 +160,16 @@ static bool body_control_is_overvoltage(uint32_t battery_mv)
  */
 static void body_control_update_fault(FaultId_t id, bool condition_present)
 {
-    if (!FaultManager_Update(id, condition_present))
+    const bool changed = FaultManager_Update(id, condition_present);
+
+    /* Every evaluation - pass or fail - is forwarded to DTC memory, not just
+     * the transitions. A passing result is what clears "test not completed"
+     * and proves to a tester that the monitor actually ran this cycle. */
+    DiagApp_ReportFault(id, FaultManager_IsActive(id));
+
+    if (!changed)
     {
-        return;     /* no change - nothing worth saying */
+        return;     /* no change - nothing worth logging */
     }
 
     if (FaultManager_IsActive(id))
@@ -214,6 +223,12 @@ static void body_control_task_10ms(void)
                  VehicleStateMachine_GetStateName(previous),
                  VehicleStateMachine_GetStateName(current),
                  VehicleStateMachine_GetEventName(event));
+
+        /* Leaving OFF is ignition-on: a new DTC operation cycle begins. */
+        if ((previous == VEHICLE_STATE_OFF) && (current == VEHICLE_STATE_ACC))
+        {
+            DiagApp_StartOperationCycle();
+        }
     }
 
     /* Scheduler health is evaluated here because this is the fastest task:
@@ -284,6 +299,18 @@ static void body_control_task_50ms(void)
 
     body_control_update_status_led(state);
 
+    /* A diagnostic lamp self-test overrides normal lighting logic: every lamp
+     * on, brake light at full brightness, for the duration of the routine.
+     * The routine itself refuses to start while the engine is running. */
+    if (DiagApp_IsLampTestActive())
+    {
+        GpioDriver_SetOutput(DOUT_HEADLIGHT, true);
+        GpioDriver_SetOutput(DOUT_INDICATOR_LEFT, true);
+        GpioDriver_SetOutput(DOUT_INDICATOR_RIGHT, true);
+        PwmDriver_SetBrakeDuty(ECU_PWM_BRAKE_FULL);
+        return;
+    }
+
     /* In FAULT, and in any state that does not permit lighting, every
      * exterior lamp is forced off in one call. Making the fail-safe path a
      * single explicit statement - rather than relying on each lamp's own
@@ -329,10 +356,8 @@ static void body_control_task_50ms(void)
 
 static void body_control_task_100ms(void)
 {
-    /* Receive before transmit, so this cycle's outgoing frame reflects the
-     * most recent information available from the rest of the network. */
-    CanManager_ProcessReceived();
-
+    /* Reception now happens every 5 ms in the diagnostic task (DiagApp_Task),
+     * so this frame already reflects the latest data from the network. */
     CanVehicleStatus_t status;
 
     status.vehicle_state   = (uint8_t)VehicleStateMachine_GetState();
@@ -442,7 +467,7 @@ static void body_control_task_500ms(void)
 /* Initialisation                                                            */
 /* ========================================================================= */
 
-bool BodyControl_Init(void)
+bool BodyControl_Init(bool was_watchdog_reset)
 {
     bool ok = true;
 
@@ -455,6 +480,8 @@ bool BodyControl_Init(void)
          * Recorded so BodyControl_IsHealthy() still reflects reality. */
         ok = false;
     }
+
+    Logger_PrintBanner(was_watchdog_reset);
 
     /* 2. Drivers: put the hardware into a defined state. */
     GpioDriver_Init();
@@ -485,6 +512,22 @@ bool BodyControl_Init(void)
         ok = false;
     }
 
+    /* Diagnostics. May erase a flash sector while compacting the DTC store,
+     * which takes up to ~2 s - acceptable only because the watchdog is not
+     * armed yet (main.c arms it after BodyControl_Init returns). */
+    if (DiagApp_Init())
+    {
+        LOG_INFO("Diagnostics ready - UDS on 0x%03X/0x%03X, NVM %u%% used",
+                 (unsigned int)ECU_DIAG_CAN_ID_PHYSICAL,
+                 (unsigned int)ECU_DIAG_CAN_ID_RESPONSE,
+                 (unsigned int)DiagManager_GetNvmUsagePercent());
+    }
+    else
+    {
+        LOG_WARN("NVM unavailable - DTCs will not survive a reset");
+        ok = false;
+    }
+
     /* 4. Application state. */
     VehicleStateMachine_Init();
 
@@ -497,6 +540,11 @@ bool BodyControl_Init(void)
      *    order: sample, then act, then communicate, then diagnose. */
     Scheduler_Init();
 
+    /* Reception + diagnostics first: every other task then works with the
+     * freshest frames. At 5 ms, a UDS request is answered well inside the
+     * 50 ms P2 limit the ECU advertises. */
+    ok &= Scheduler_RegisterTask("diag_rx",   DiagApp_Task,
+                                 ECU_TASK_PERIOD_5MS);
     ok &= Scheduler_RegisterTask("input_sm",  body_control_task_10ms,
                                  ECU_TASK_PERIOD_10MS);
     ok &= Scheduler_RegisterTask("outputs",   body_control_task_50ms,
@@ -516,4 +564,9 @@ bool BodyControl_Init(void)
 bool BodyControl_IsHealthy(void)
 {
     return s_init_ok;
+}
+
+uint32_t BodyControl_GetBatteryMv(void)
+{
+    return s_battery_mv;
 }

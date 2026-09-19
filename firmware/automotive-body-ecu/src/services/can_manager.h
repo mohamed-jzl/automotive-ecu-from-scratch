@@ -39,7 +39,24 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "can_driver.h"
 #include "can_signals.h"
+
+/**
+ * @brief Handler offered every received frame before normal processing.
+ *
+ * @return true if the handler consumed the frame.
+ */
+typedef bool (*CanFrameHandlerFn_t)(const CanFrame_t *frame);
+
+/**
+ * @brief Register a handler that sees every received frame first.
+ *
+ * Used by the diagnostic stack to claim 0x7E0/0x7DF frames. A registered
+ * callback keeps the dependency pointing the right way: the CAN manager does
+ * not need to know that diagnostics exist, it just offers frames.
+ */
+void CanManager_SetFrameHandler(CanFrameHandlerFn_t handler);
 
 /**
  * @brief Initialise the CAN driver and reset all counters and timestamps.

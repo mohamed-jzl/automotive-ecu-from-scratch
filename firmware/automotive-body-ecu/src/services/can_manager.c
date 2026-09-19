@@ -24,6 +24,13 @@ static bool              s_engine_ever_received   = false;
 static uint32_t s_crc_error_count      = 0U;
 static uint32_t s_received_frame_count = 0U;
 
+static CanFrameHandlerFn_t s_frame_handler = NULL;
+
+void CanManager_SetFrameHandler(CanFrameHandlerFn_t handler)
+{
+    s_frame_handler = handler;
+}
+
 bool CanManager_Init(void)
 {
     s_alive_vehicle_status   = 0U;
@@ -89,6 +96,13 @@ void CanManager_ProcessReceived(void)
      * silently discards data. */
     while (CanDriver_Receive(&frame))
     {
+        /* Diagnostic frames are claimed first. They may legitimately be
+         * shorter than 8 bytes, so this must happen before the DLC check. */
+        if ((s_frame_handler != NULL) && s_frame_handler(&frame))
+        {
+            continue;
+        }
+
         if (frame.dlc != CAN_MESSAGE_DLC)
         {
             /* Every message in this project's interface is 8 bytes. A

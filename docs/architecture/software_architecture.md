@@ -23,13 +23,21 @@
 └──────────┬──────────────────────────────────┬────────────────┘
            │                                  │
 ┌──────────▼──────────────────────────────────▼────────────────┐
-│  SERVICE LAYER                src/services/                  │
+│  SERVICE LAYER                src/services/  +  src/diag/    │
 │                                                              │
 │  scheduler.c       Time-triggered task dispatch + WCET       │
 │  fault_manager.c   Maturation and healing.      PURE         │
 │  can_signals.c     Byte-level packing + CRC.    PURE         │
 │  can_manager.c     Alive counters, RX timeout, staleness     │
 │  logger.c          Severity-tagged UART output               │
+│  nvm_store.c       Power-loss-safe flash log.   PURE         │
+│                                                              │
+│  diagnostic stack (v0.2) - all PURE, also runs on a PC:      │
+│  isotp.c           ISO 15765-2 segmentation / flow control   │
+│  uds_server.c      ISO 14229-1 services, sessions, NRCs      │
+│  uds_security.c    Seed/key (educational)                    │
+│  dtc_manager.c     DTC status bits, aging, freeze frames     │
+│  diag_manager.c    Glue: CAN -> ISO-TP -> UDS, persistence   │
 └────────────────────────────┬─────────────────────────────────┘
                              │
 ┌────────────────────────────▼─────────────────────────────────┐
@@ -38,6 +46,7 @@
 │                                                              │
 │  gpio_driver.c   uart_driver.c   adc_driver.c                │
 │  pwm_driver.c    can_driver.c    watchdog_driver.c           │
+│  flash_driver.c  mcu_driver.c                         (v0.2) │
 └────────────────────────────┬─────────────────────────────────┘
                              │
 ┌────────────────────────────▼─────────────────────────────────┐
@@ -75,6 +84,35 @@ no HAL include, no register access, no time source:
 | `fault_manager.c` | Counts calls, not milliseconds | Maturation timing tested exactly, with no hardware |
 | `can_signals.c` | Bytes in, bytes out | Exact wire layout asserted; bit-flip corruption simulated |
 | `AdcDriver_RawToBatteryMv` | Pure inline arithmetic | All 4096 possible inputs swept for monotonicity |
+| `isotp.c` | Frames in via a call, out via a function pointer, time as a parameter | Lost frames, wrong sequence numbers, timeouts replayed exactly |
+| `uds_server.c` | Request bytes in, response bytes out | Every NRC path tested byte-for-byte |
+| `dtc_manager.c` | Counts operation cycles, not days | 40-cycle aging tested in a loop |
+| `nvm_store.c` | All flash access through function pointers | Power cuts mid-write simulated on every run |
+| `diag_manager.c` | Hardware reached only through `DiagConfig_t` | The whole diagnostic stack runs on a PC as a SIL target |
+
+### Dependency injection: how the diagnostic stack stays pure
+
+The diagnostic stack needs to send CAN frames, erase flash and reset the MCU,
+yet contains no HAL call. It receives those abilities as **function pointers**
+at initialisation (`DiagConfig_t` in `diag_manager.h`):
+
+```
+                 DiagConfig_t
+               ┌───────────────┐
+ diag_app.c ──▶│ send_frame    │──▶ CanDriver_Transmit      (on the STM32)
+ (target)      │ erase_region  │──▶ FlashDriver_EraseSector
+               │ program_word  │──▶ FlashDriver_ProgramWord
+               │ system_reset  │──▶ McuDriver_SystemReset
+               └───────────────┘
+
+ sil_ecu.c  ──▶  the same fields ──▶ Python callback / RAM "flash" / flag
+ (PC)
+```
+
+Same diagnostic code, two platforms. This is also the shape of AUTOSAR's
+split between the generic diagnostic module (DCM) and the ECU-specific data it
+serves: `src/diag/` would work unchanged in a door module; `diag_app.c` is
+what makes it a *Body Control* ECU (its DIDs, DTCs and routine).
 
 Provoking the same coverage on hardware would mean a marginal battery voltage
 held at exactly the right level for exactly the right number of cycles. In
@@ -103,10 +141,17 @@ main()
 
 | Task | Period | Responsibility |
 |---|---|---|
+| `diag_rx` | 5 ms | Drain the CAN receive queue, run ISO-TP and UDS, save DTCs (v0.2) |
 | `input_sm` | 10 ms | Sample inputs, debounce, generate events, run the state machine |
-| `outputs` | 50 ms | Status LED, headlights, indicator flashing, brake PWM |
-| `can_comms` | 100 ms | Receive and decode, then transmit BCM_VehicleStatus |
+| `outputs` | 50 ms | Status LED, lamp self-test, headlights, indicators, brake PWM |
+| `can_comms` | 100 ms | Transmit BCM_VehicleStatus |
 | `diag` | 500 ms | Measure battery, evaluate voltage faults, transmit diagnostics |
+
+One interrupt exists alongside the tasks: **CAN receive** (`CAN1_RX0_IRQHandler`).
+It only copies frames from the 3-message hardware FIFO into a 32-frame
+software queue; all processing happens in `diag_rx`. The queue is a
+single-producer / single-consumer ring buffer, safe without locks because each
+index has exactly one writer — see the comment block in `can_driver.c`.
 
 ### Why cooperative rather than an RTOS
 
@@ -166,9 +211,28 @@ Measured from the linked image (`arm-none-eabi-size`):
 
 | Section | Bytes | Of available | Contents |
 |---|---|---|---|
-| `.text` | 29 056 | 5.5% of 512 KB flash | Code and constants |
-| `.data` | 104 | — | Initialised globals (in flash, copied to RAM at boot) |
-| `.bss` | 2 488 | 1.9% of 128 KB SRAM | Zero-initialised globals |
+| `.text` | 45 796 | 17.5% of the 256 KB code region | Code and constants |
+| `.data` | 144 | — | Initialised globals (in flash, copied to RAM at boot) |
+| `.bss` | 4 440 | 3.4% of 128 KB SRAM | Zero-initialised globals (incl. two 256-byte ISO-TP buffers and the 32-frame CAN queue) |
+
+v0.1 was 29 KB of code; the diagnostic stack added about 16 KB.
+
+### Flash memory map
+
+```
+0x08000000 ┌────────────────────────────┐
+           │ sectors 0-5   256 KB       │  code region (linker script FLASH)
+           │ vector table, code, consts │
+0x08040000 ├────────────────────────────┤
+           │ sector 6      128 KB       │  NVM region A  ┐ DTCs + VIN,
+0x08060000 ├────────────────────────────┤                │ ping-pong
+           │ sector 7      128 KB       │  NVM region B  ┘ (nvm_store.c)
+0x0807FFFF └────────────────────────────┘
+```
+
+The linker script caps the code region at 256 KB. Without that cap the linker
+could legally place code in sectors 6-7, and the first DTC save would erase
+part of the running firmware.
 
 **No dynamic allocation anywhere.** `malloc` is never called. Every buffer is
 statically sized, so memory use is known at link time and cannot fail at

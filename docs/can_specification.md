@@ -65,6 +65,15 @@ The STM32 provides logic-level TX and RX only. An external transceiver
 | 0x100 | BCM_VehicleStatus | TX | 100 ms | 8 | Body ECU |
 | 0x101 | BCM_Diagnostics | TX | 500 ms | 8 | Body ECU |
 | 0x200 | PCM_EngineStatus | RX | 100 ms | 8 | Powertrain ECU |
+| 0x7DF | Diagnostic request, functional | RX | on demand | 8 | Tester (broadcast) |
+| 0x7E0 | Diagnostic request, physical | RX | on demand | 8 | Tester |
+| 0x7E8 | Diagnostic response | TX | on demand | 8 | Body ECU |
+
+The three diagnostic identifiers carry ISO-TP frames, not signals, so they
+have no DBC layout: their content is defined in
+[uds_specification.md](uds_specification.md). Their high identifiers give them
+the lowest bus priority, which is deliberate - diagnostics must never delay
+the vehicle's own periodic traffic.
 
 A lower identifier wins CAN arbitration, so the numbering encodes priority. In
 a production vehicle the safety-relevant powertrain messages would be given

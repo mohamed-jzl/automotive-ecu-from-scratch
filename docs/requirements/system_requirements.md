@@ -2,7 +2,7 @@
 
 **Project:** Automotive Body Control ECU
 **Target:** STM32 Nucleo-F446RE
-**Version:** 0.1.0
+**Version:** 0.2.0 (adds section 4.10, UDS diagnostics)
 **Status:** Baseline
 
 ---
@@ -159,6 +159,91 @@ is stated as a requirement rather than left to implementation judgement.
 | **REQ-082** | The ECU **shall** log every vehicle state transition and every fault transition, and **shall not** log unchanged state. |
 | **REQ-083** | The status LED **shall** indicate the operating mode: 1 Hz flash in OFF, steady in ACC/ON/RUN, 5 Hz flash in FAULT. |
 
+### 4.10 UDS diagnostics (ISO 14229-1 over ISO 15765-2)
+
+Interface details — byte formats, DIDs, DTC codes — are in
+[uds_specification.md](../uds_specification.md). The requirements below state
+what must hold; the specification states exactly how it looks on the wire.
+
+**Protocol and addressing**
+
+| ID | Requirement |
+|----|-------------|
+| **REQ-100** | The ECU **shall** accept physical requests on `0x7E0` and functional requests on `0x7DF`, and **shall** respond on `0x7E8`. |
+| **REQ-101** | The ECU **shall** answer an unsupported service with NRC `0x11`, an unsupported sub-function with `0x12`, and a request of wrong length with `0x13`. |
+| **REQ-102** | When a request violates several rules, the ECU **shall** report them in the ISO 14229-1 order: service support, session, length, then service-specific checks. |
+| **REQ-103** | For functionally addressed requests the ECU **shall not** send NRCs `0x11`, `0x12`, `0x31`, `0x7E` or `0x7F`; when bit 7 of the sub-function is set it **shall not** send a positive response, but **shall** still send any other negative response. |
+| **REQ-104** | Services restricted to the extended session **shall** be refused in the default session with NRC `0x7F`. |
+
+**Sessions**
+
+| ID | Requirement |
+|----|-------------|
+| **REQ-110** | The ECU **shall** start in the default session after every reset. |
+| **REQ-111** | On entering a session the ECU **shall** report P2server = 50 ms and P2\*server = 5000 ms. |
+| **REQ-112** | The ECU **shall** return to the default session, and re-lock security, when no request is received for 5000 ms in a non-default session (S3). |
+| **REQ-113** | TesterPresent (`0x3E`) **shall** restart the S3 timer. |
+
+**Data identifiers**
+
+| ID | Requirement |
+|----|-------------|
+| **REQ-120** | The ECU **shall** provide VIN (`F190`), software version (`F195`), serial number (`F18C`) and active session (`F186`). |
+| **REQ-121** | The ECU **shall** provide battery voltage, vehicle state, inputs, active faults and uptime as DIDs `0100`–`0104`. |
+| **REQ-122** | A request containing no supported DID **shall** be refused with NRC `0x31`. |
+| **REQ-123** | The VIN **shall** be writable only in the extended session with security access unlocked. |
+| **REQ-124** | The ECU **shall** reject a VIN containing any character outside ISO 3779 (`0-9`, `A-Z` except `I`, `O`, `Q`) with NRC `0x31`. |
+
+**Security access**
+
+| ID | Requirement |
+|----|-------------|
+| **REQ-130** | The ECU **shall** unlock security level 1 when it receives the key matching the most recent seed. |
+| **REQ-131** | WriteDataByIdentifier and the lamp self-test routine **shall** be refused with NRC `0x33` while security is locked. |
+| **REQ-132** | After 3 consecutive invalid keys the ECU **shall** answer NRC `0x36` and refuse seed requests with NRC `0x37` for 10 s. |
+| **REQ-133** | A seed **shall** never be zero while locked, **shall** be valid for one key attempt only, and **shall** be `00000000` when already unlocked. |
+
+**Reset and persistence**
+
+| ID | Requirement |
+|----|-------------|
+| **REQ-140** | On ECUReset the ECU **shall** transmit its positive response before resetting. |
+| **REQ-141** | The VIN and all DTC information **shall** be retained across resets and power cycles. |
+| **REQ-142** | An interruption of power during a non-volatile write **shall not** corrupt or lose the previously stored data. |
+| **REQ-143** | The ECU **shall not** erase flash after the watchdog has been armed. |
+
+**DTC management**
+
+| ID | Requirement |
+|----|-------------|
+| **REQ-150** | Each DTC **shall** carry a status byte whose eight bits behave as defined in ISO 14229-1 Annex D. |
+| **REQ-151** | When a DTC is first confirmed, the ECU **shall** store a snapshot of battery voltage and vehicle state. |
+| **REQ-152** | ClearDiagnosticInformation **shall** reset all DTCs, or one DTC, to the initial status `0x50`. |
+| **REQ-153** | While ControlDTCSetting is off, DTC status **shall not** change; the setting **shall** return to on when the default session is entered. |
+| **REQ-154** | A confirmed DTC **shall** be erased after 40 consecutive operation cycles without failure. |
+| **REQ-155** | An operation cycle **shall** begin at each transition from OFF to ACC. |
+
+**Transport and reception**
+
+| ID | Requirement |
+|----|-------------|
+| **REQ-160** | The ECU **shall** send and receive UDS messages of up to 256 bytes using ISO-TP segmentation, flow control and the N_Cr / N_Bs timeouts. |
+| **REQ-161** | CAN frames **shall** be received by interrupt into a queue of at least 32 frames, so that no frame of a diagnostic request is lost between task activations. |
+
+**Routines**
+
+| ID | Requirement |
+|----|-------------|
+| **REQ-170** | Routine `0x0201` **shall** light all exterior lamps for 3 s, **shall** be refused with NRC `0x22` while the engine runs, and **shall** report its status. |
+
+*Rationale for REQ-143:* erasing a 128 KB flash sector stalls the CPU for 1-2
+seconds, longer than the watchdog timeout. Any design that erases at runtime
+eventually resets the ECU in the middle of a write.
+
+*Rationale for REQ-140:* if the ECU reset before its response left the bus,
+the tester would time out and could not tell a successful reset from a lost
+request.
+
 ---
 
 ## 5. Explicitly out of scope
@@ -166,7 +251,11 @@ is stated as a requirement rather than left to implementation judgement.
 Stating what a system does *not* do is as important as stating what it does.
 These are deliberate exclusions, not oversights:
 
-- No UDS / ISO 14229 diagnostic services, and no non-volatile DTC storage.
+- No programming session or bootloader: UDS services `0x34`/`0x36`/`0x37`
+  (download), `0x28`, `0x2F` and `0x29` are not implemented. See
+  [uds_specification.md](../uds_specification.md#12-not-implemented).
+- No production-grade security: the seed/key algorithm is educational and
+  offers no protection against a determined attacker.
 - No ISO 26262 functional safety development; no ASIL is claimed.
 - No AUTOSAR conformance. The architecture is *inspired by* its layering.
 - No bootloader or firmware update capability.
@@ -182,6 +271,8 @@ Recorded so that a reviewer is not left to discover them:
 |---|---|
 | UART logging is blocking | A long log line inside a fast task can itself cause the deadline miss it was added to diagnose. A ring buffer with DMA is the correct fix. |
 | IWDG timeout tolerance is ±50% | The LSI is an untrimmed RC oscillator. The true timeout lies between roughly 330 ms and 1 s. A safety-critical design would measure LSI against a precise clock and compensate. |
-| CAN reception is polled, not interrupt-driven | Adequate at this bus load, but a heavily loaded bus could overrun the 3-message hardware FIFO between polls. |
+| ~~CAN reception is polled~~ | **Resolved in 0.2.0**: reception is interrupt-driven into a 32-frame queue (REQ-161). |
+| No hardware RNG for security seeds | The STM32F446 has none; seeds come from a PRNG seeded by the chip ID and request timing. Not cryptographically secure. |
+| DTC warning lamp follows the live fault | Production strategies usually keep the lamp lit for several clean cycles after the fault disappears. |
 | Timing is measured with 1 ms resolution | A task taking 0.4 ms and one taking 1.4 ms are indistinguishable. A cycle counter (DWT) would give sub-microsecond resolution. |
 | Headlights are driven by vehicle state, not a switch | There are no spare inputs on the bench. A real BCM has a light switch and an ambient sensor. |

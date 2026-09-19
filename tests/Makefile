@@ -8,7 +8,8 @@
 #  deployed to an ECU, so an ordinary C compiler can build and run them.
 #
 #  Deliberately NOT tested here: gpio_driver, adc_driver.c, pwm_driver,
-#  uart_driver, can_driver, watchdog_driver. Those exist to touch registers,
+#  uart_driver, can_driver, watchdog_driver, flash_driver, mcu_driver, and the
+#  application glue in diag_app.c. Those exist to touch registers,
 #  and testing them without hardware would mean mocking the entire HAL - a
 #  large amount of work that would mostly prove the mocks match the mocks.
 #  They are verified on the bench instead, and the test plan says so.
@@ -22,7 +23,8 @@
 #  Requires: gcc (or clang) and make.
 #    Linux/macOS  - already present, or `sudo apt install build-essential`
 #    Windows      - MSYS2 (`pacman -S mingw-w64-x86_64-gcc make`), or WSL,
-#                   or simply let the GitHub Actions CI run them on push.
+#                   or `python tools/run_unit_tests.py`, which needs no make and
+#                   can use the zig C compiler installed with `pip install ziglang`.
 # =============================================================================
 
 CC      ?= gcc
@@ -34,6 +36,7 @@ FW      := ../firmware/automotive-body-ecu/src
 INCLUDES := \
 	-Iframework \
 	-I$(FW)/app \
+	-I$(FW)/diag \
 	-I$(FW)/services \
 	-I$(FW)/drivers \
 	-I$(FW)/config
@@ -56,7 +59,12 @@ FRAMEWORK := framework/unity_min.c
 SUITES := test_vehicle_state_machine \
           test_fault_manager \
           test_can_signals \
-          test_adc_conversion
+          test_adc_conversion \
+          test_isotp \
+          test_uds_server \
+          test_uds_security \
+          test_dtc_manager \
+          test_nvm_store
 
 # Production sources each suite needs. The test links the REAL module - never
 # a copy - so the tests can only pass if the shipped code is correct.
@@ -66,6 +74,13 @@ SRC_test_can_signals           := $(FW)/services/can_signals.c
 SRC_test_adc_conversion        :=
 # (the ADC conversion under test is a pure inline function in the header,
 #  so no .c file is required)
+SRC_test_isotp                 := $(FW)/diag/isotp.c
+SRC_test_uds_server            := $(FW)/diag/uds_server.c \
+                                  $(FW)/diag/dtc_manager.c \
+                                  $(FW)/diag/uds_security.c
+SRC_test_uds_security          := $(FW)/diag/uds_security.c
+SRC_test_dtc_manager           := $(FW)/diag/dtc_manager.c
+SRC_test_nvm_store             := $(FW)/services/nvm_store.c
 
 EXES := $(addprefix $(BUILD)/,$(SUITES))
 

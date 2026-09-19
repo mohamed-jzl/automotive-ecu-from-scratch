@@ -15,6 +15,52 @@ static CAN_HandleTypeDef s_can;
 static bool              s_initialised      = false;
 static uint32_t          s_tx_failure_count = 0U;
 
+/* =========================================================================
+ * Receive queue: interrupt (producer) -> main loop (consumer)
+ *
+ * The bxCAN hardware FIFO holds only 3 frames. A diagnostic tester sending a
+ * multi-frame request can deliver them faster than a 5 ms task polls, so
+ * reception is interrupt-driven: the ISR moves every frame into this larger
+ * software queue immediately, and the main loop drains it at its own pace.
+ *
+ * This is a single-producer / single-consumer ring buffer, and it needs NO
+ * lock, because each index has exactly one writer:
+ *
+ *     s_rx_head  written only by the ISR       (where the next frame goes)
+ *     s_rx_tail  written only by the main loop (where the next read comes from)
+ *
+ *          tail              head
+ *           v                 v
+ *     [ .. | F1 | F2 | F3 |   |   | .. ]     empty when head == tail
+ *                                           full  when head + 1 == tail
+ *
+ * Both indices are `volatile` because each is changed by code the compiler
+ * cannot see from the other context. Without it, the main loop could keep
+ * s_rx_head in a register and never notice a new frame.
+ *
+ * `volatile` is not enough on its own, though. The compiler may still move an
+ * ordinary write (copying the frame into the slot) AFTER the volatile write
+ * that publishes it (advancing head). __DMB() is a memory barrier with a
+ * compiler "memory" clobber: nothing is reordered across it, so the frame is
+ * always complete before head says it exists.
+ * ========================================================================= */
+
+#define RX_QUEUE_MASK   (ECU_CAN_RX_QUEUE_SIZE - 1U)
+
+#if ((ECU_CAN_RX_QUEUE_SIZE & RX_QUEUE_MASK) != 0U)
+#error "ECU_CAN_RX_QUEUE_SIZE must be a power of two"
+#endif
+
+static CanFrame_t        s_rx_queue[ECU_CAN_RX_QUEUE_SIZE];
+static volatile uint32_t s_rx_head           = 0U;
+static volatile uint32_t s_rx_tail           = 0U;
+static volatile uint32_t s_rx_overflow_count = 0U;
+
+/* Priority of the CAN receive interrupt. Lower number = more urgent on
+ * Cortex-M. Set below SysTick's so the millisecond tick is never delayed by
+ * a burst of CAN traffic. */
+#define CAN_RX_IRQ_PRIORITY  5U
+
 /**
  * @brief Configure the acceptance filter to receive every standard identifier.
  *
@@ -125,9 +171,97 @@ bool CanDriver_Init(void)
         return false;
     }
 
+    s_rx_head           = 0U;
+    s_rx_tail           = 0U;
+    s_rx_overflow_count = 0U;
+
+    /* Ask the controller to raise an interrupt whenever FIFO 0 holds a frame,
+     * then enable that interrupt line in the NVIC (the Cortex-M interrupt
+     * controller). Both steps are needed: the peripheral decides WHEN to
+     * signal, the NVIC decides WHETHER the CPU listens. */
+    if (HAL_CAN_ActivateNotification(&s_can, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK)
+    {
+        s_initialised = false;
+        return false;
+    }
+
+    HAL_NVIC_SetPriority(CAN1_RX0_IRQn, CAN_RX_IRQ_PRIORITY, 0U);
+    HAL_NVIC_EnableIRQ(CAN1_RX0_IRQn);
+
     s_tx_failure_count = 0U;
     s_initialised      = true;
     return true;
+}
+
+/* ========================================================================= */
+/* Interrupt context                                                         */
+/* ========================================================================= */
+
+/**
+ * @brief CAN1 FIFO 0 interrupt vector.
+ *
+ * The name must match the vector table entry in startup_stm32f446retx.s
+ * exactly. There it is declared "weak", pointing at a default handler that
+ * loops forever; defining a function with the same name here replaces it.
+ * A typo in this name compiles without complaint and hangs the ECU on the
+ * first received frame - which is why it is worth knowing.
+ */
+void CAN1_RX0_IRQHandler(void)
+{
+    HAL_CAN_IRQHandler(&s_can);
+}
+
+/**
+ * @brief Called by the HAL from the interrupt above, once per event.
+ *
+ * Runs in interrupt context: it must be short, must never block, and must
+ * never call anything that is not safe to interrupt the main loop with.
+ * Here it only copies frames into the queue.
+ */
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+{
+    CAN_RxHeaderTypeDef header;
+    uint8_t             payload[CAN_FRAME_MAX_DLC];
+
+    /* Empty the whole hardware FIFO in one interrupt rather than taking one
+     * interrupt per frame. */
+    while (HAL_CAN_GetRxFifoFillLevel(hcan, CAN_RX_FIFO0) > 0U)
+    {
+        if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &header, payload) != HAL_OK)
+        {
+            return;
+        }
+
+        /* Extended (29-bit) identifiers are not part of this project's
+         * interfaces; filtering them here keeps every upper layer simpler. */
+        if (header.IDE != CAN_ID_STD)
+        {
+            continue;
+        }
+
+        const uint32_t head = s_rx_head;
+        const uint32_t next = (head + 1U) & RX_QUEUE_MASK;
+
+        if (next == s_rx_tail)
+        {
+            /* Queue full: drop the NEWEST frame and count it. Overwriting the
+             * oldest instead would corrupt a frame the main loop may be
+             * reading right now. */
+            s_rx_overflow_count++;
+            continue;
+        }
+
+        CanFrame_t *slot = &s_rx_queue[head];
+        const uint8_t dlc = (header.DLC > CAN_FRAME_MAX_DLC) ? CAN_FRAME_MAX_DLC
+                                                             : (uint8_t)header.DLC;
+        slot->id  = header.StdId;
+        slot->dlc = dlc;
+        (void)memset(slot->data, 0, CAN_FRAME_MAX_DLC);
+        (void)memcpy(slot->data, payload, dlc);
+
+        __DMB();            /* frame fully written BEFORE it is published */
+        s_rx_head = next;
+    }
 }
 
 bool CanDriver_Transmit(const CanFrame_t *frame)
@@ -178,44 +312,24 @@ bool CanDriver_Receive(CanFrame_t *frame)
         return false;
     }
 
-    if (HAL_CAN_GetRxFifoFillLevel(&s_can, CAN_RX_FIFO0) == 0U)
+    const uint32_t tail = s_rx_tail;
+
+    if (tail == s_rx_head)
     {
-        return false;   /* nothing waiting - not an error */
+        return false;   /* queue empty - not an error */
     }
 
-    CAN_RxHeaderTypeDef header = {0};
-    uint8_t             payload[CAN_FRAME_MAX_DLC] = {0};
+    *frame = s_rx_queue[tail];
 
-    if (HAL_CAN_GetRxMessage(&s_can, CAN_RX_FIFO0, &header, payload) != HAL_OK)
-    {
-        return false;
-    }
-
-    /* Extended (29-bit) identifiers are outside this project's message set.
-     * Discarding them here keeps every layer above free of the distinction. */
-    if (header.IDE != CAN_ID_STD)
-    {
-        return false;
-    }
-
-    frame->id  = header.StdId;
-    frame->dlc = (uint8_t)header.DLC;
-
-    if (frame->dlc > CAN_FRAME_MAX_DLC)
-    {
-        frame->dlc = CAN_FRAME_MAX_DLC;
-    }
-
-    (void)memcpy(frame->data, payload, frame->dlc);
-
-    /* Zero the unused tail so a short frame never exposes stale bytes from a
-     * previous, longer message. */
-    if (frame->dlc < CAN_FRAME_MAX_DLC)
-    {
-        (void)memset(&frame->data[frame->dlc], 0, CAN_FRAME_MAX_DLC - frame->dlc);
-    }
+    __DMB();            /* finish reading the slot BEFORE handing it back */
+    s_rx_tail = (tail + 1U) & RX_QUEUE_MASK;
 
     return true;
+}
+
+uint32_t CanDriver_GetRxOverflowCount(void)
+{
+    return s_rx_overflow_count;
 }
 
 bool CanDriver_IsBusOff(void)

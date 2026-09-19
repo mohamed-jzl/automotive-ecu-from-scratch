@@ -1,11 +1,13 @@
 #  Continuous integration for the Automotive Body Control ECU
 #
-#  Every push and pull request answers four questions automatically:
+#  Every push and pull request answers five questions automatically:
 #
 #    1. Does the firmware still compile and link for the target?
-#    2. Do all 67 unit tests still pass?
+#    2. Do all 186 unit tests still pass?
 #    3. Does the system test framework itself still work?
-#    4. Does static analysis find anything new?
+#    4. Does the production UDS stack pass 24 system tests driven by an
+#       independent UDS client (software-in-the-loop)?
+#    5. Does static analysis find anything new?
 #
 #  The point is not the badge. It is that a regression is caught by the machine
 #  minutes after it is introduced, rather than by a person weeks later on a
@@ -63,7 +65,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          INC="-ICore/Inc -Isrc/app -Isrc/services -Isrc/drivers -Isrc/config \
+          INC="-ICore/Inc -Isrc/app -Isrc/diag -Isrc/services -Isrc/drivers -Isrc/config \
                -IDrivers/STM32F4xx_HAL_Driver/Inc \
                -IDrivers/STM32F4xx_HAL_Driver/Inc/Legacy \
                -IDrivers/BSP/STM32F4xx-Nucleo \
@@ -79,7 +81,7 @@ jobs:
 
           for f in Drivers/STM32F4xx_HAL_Driver/Src/*.c \
                    Drivers/BSP/STM32F4xx-Nucleo/*.c \
-                   Core/Src/*.c src/drivers/*.c src/services/*.c src/app/*.c; do
+                   Core/Src/*.c src/drivers/*.c src/services/*.c src/diag/*.c src/app/*.c; do
             obj="build/$(echo "$f" | tr '/' '_' | sed 's/\.c$/.o/')"
             arm-none-eabi-gcc $FLAGS $INC -c "$f" -o "$obj"
           done
@@ -101,7 +103,7 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
           arm-none-eabi-size build/automotive-body-ecu.elf | tee -a $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "Flash: 512 KB available | RAM: 128 KB available" >> $GITHUB_STEP_SUMMARY
+          echo "Flash: 256 KB code region (sectors 6-7 reserved for NVM) | RAM: 128 KB" >> $GITHUB_STEP_SUMMARY
 
       # Keeping the built image lets you download and flash the exact binary
       # that CI tested, rather than rebuilding and hoping it is identical.
@@ -194,6 +196,43 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
+  #  UDS diagnostics, software-in-the-loop.
+  #
+  #  The production diagnostic stack (src/diag/*.c + nvm_store.c) is compiled
+  #  into a shared library and driven over a virtual CAN bus by udsoncan and
+  #  can-isotp - independent implementations of ISO 14229 and ISO 15765. This
+  #  is the strongest check CI can make without hardware: our ECU code must
+  #  interoperate with a tester written by someone else.
+  # ---------------------------------------------------------------------------
+  diagnostics-sil:
+    name: UDS diagnostics (SIL)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        working-directory: tools/can_tester
+        run: pip install -r requirements.txt
+
+      - name: Run the UDS system tests against the SIL target
+        working-directory: tools/can_tester
+        timeout-minutes: 5
+        run: python run_diag_tests.py --sil --report diag_report.html
+
+      - name: Upload the diagnostic test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-report-${{ github.sha }}
+          path: tools/can_tester/diag_report.html
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
   #  Static analysis. Finds defects a compiler does not look for.
   # ---------------------------------------------------------------------------
   static-analysis:
@@ -208,29 +247,53 @@ jobs:
 
       # Only our own code is analysed. ST's HAL is third-party and generates
       # thousands of style findings that would bury anything real.
-      - name: Analyse application code
+      #
+      # Two passes. Findings that indicate real defects (warning, performance,
+      # portability) fail the build. Style findings are reported but do not:
+      # they are matters of taste that differ between cppcheck versions, and a
+      # build that fails on taste teaches people to ignore the build.
+      - name: Analyse application code (defects - blocking)
         run: |
           cppcheck \
-            --enable=warning,style,performance,portability \
+            --enable=warning,performance,portability \
             --inline-suppr \
             --error-exitcode=1 \
+            --suppress=missingIncludeSystem \
+            --std=c11 \
+            -I firmware/automotive-body-ecu/src/config \
+            -I firmware/automotive-body-ecu/src/drivers \
+            -I firmware/automotive-body-ecu/src/services \
+            -I firmware/automotive-body-ecu/src/diag \
+            -I firmware/automotive-body-ecu/src/app \
+            firmware/automotive-body-ecu/src/ \
+            tests/ tools/sil/
+
+      - name: Analyse application code (style - informational)
+        run: |
+          cppcheck \
+            --enable=style \
+            --inline-suppr \
             --suppress=missingIncludeSystem \
             --suppress=unusedFunction \
             --std=c11 \
             -I firmware/automotive-body-ecu/src/config \
             -I firmware/automotive-body-ecu/src/drivers \
             -I firmware/automotive-body-ecu/src/services \
+            -I firmware/automotive-body-ecu/src/diag \
             -I firmware/automotive-body-ecu/src/app \
-            firmware/automotive-body-ecu/src/ \
-            tests/
+            firmware/automotive-body-ecu/src/ 2>&1 | tee cppcheck-style.txt
+          echo "### cppcheck style findings (informational)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          grep -c "style:" cppcheck-style.txt >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
 
   # ---------------------------------------------------------------------------
-  #  Single gate for branch protection: one check to require, not four.
+  #  Single gate for branch protection: one check to require, not five.
   # ---------------------------------------------------------------------------
   all-checks:
     name: All checks passed
     runs-on: ubuntu-latest
-    needs: [unit-tests, firmware-build, test-framework, static-analysis]
+    needs: [unit-tests, firmware-build, test-framework, diagnostics-sil, static-analysis]
     if: always()
     steps:
       - name: Verify every job succeeded

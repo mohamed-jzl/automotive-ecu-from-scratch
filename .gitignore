@@ -22,8 +22,14 @@ firmware/**/Release/
 *.su
 *.cyclo
 
-# --- Unit test build output --------------------------------------------------
+# --- Unit test and SIL build output ------------------------------------------
 tests/build/
+tools/sil/build/
+*.dll
+*.so
+*.dylib
+*.pdb
+*.lib
 
 # --- Test reports ------------------------------------------------------------
 # Generated per run and specific to one bench. Archive them deliberately as

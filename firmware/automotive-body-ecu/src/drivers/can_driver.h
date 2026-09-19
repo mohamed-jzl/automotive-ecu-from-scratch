@@ -95,16 +95,24 @@ bool CanDriver_Transmit(const CanFrame_t *frame);
 /**
  * @brief Fetch one received frame, if any is waiting.
  *
- * Non-blocking. Polls the receive FIFO rather than using an interrupt, which
- * keeps the data flow explicit and the timing analysable. At 500 kbit/s a
- * frame takes at least ~230 us, and the 3-message FIFO gives roughly 700 us
- * of slack - far more than our 10 ms poll period would need if the bus were
- * busy, so a production version would move to interrupt-driven reception.
+ * Non-blocking. Frames are moved out of the 3-message hardware FIFO by the
+ * CAN receive interrupt into a software queue of ECU_CAN_RX_QUEUE_SIZE
+ * frames; this function reads from that queue. (Version 0.1 polled the
+ * hardware FIFO directly, which could overflow during a fast multi-frame
+ * diagnostic request - see docs/lessons_learned.md.)
  *
  * @param  frame  Receives the frame. Untouched when no frame is available.
- * @return true if a frame was retrieved, false if the FIFO was empty.
+ * @return true if a frame was retrieved, false if the queue was empty.
  */
 bool CanDriver_Receive(CanFrame_t *frame);
+
+/**
+ * @brief Frames dropped because the software queue was full.
+ *
+ * Should stay at zero. A growing value means the consumer task is too slow
+ * for the bus load, or ECU_CAN_RX_QUEUE_SIZE is too small.
+ */
+uint32_t CanDriver_GetRxOverflowCount(void);
 
 /**
  * @brief Report whether the controller has entered the bus-off state.

@@ -134,9 +134,7 @@ int main(void)
    * installed by our own drivers is the one that takes effect.
    * --------------------------------------------------------------------- */
 
-  (void)BodyControl_Init();
-
-  Logger_PrintBanner(s_reset_by_watchdog);
+  (void)BodyControl_Init(s_reset_by_watchdog);
 
   if (!BodyControl_IsHealthy())
   {

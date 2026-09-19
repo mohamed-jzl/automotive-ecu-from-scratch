@@ -7,14 +7,21 @@
 # Linux SocketCAN - behind one API, plus a virtual backend that needs no
 # hardware at all.
 #
-# Versions are pinned to a minimum rather than exactly: 4.x has a stable API,
-# and pinning exactly would force the whole project onto one release for no
-# benefit in a project this size. A production test bench pins exact versions,
-# because a test environment that changes underneath you invalidates every
-# result it has ever produced.
+# Versions are pinned to a minimum rather than exactly: the APIs used here are
+# stable, and pinning exactly would force the whole project onto one release
+# for no benefit in a project this size. A production test bench pins exact
+# versions, because a test environment that changes underneath you
+# invalidates every result it has ever produced.
 
 python-can>=4.3.0
 
-# No other runtime dependency. The HTML report is generated with the standard
-# library alone, so the framework stays installable on a locked-down machine -
-# which is what a real test bench usually is.
+# Diagnostics (v0.2). Independent open-source implementations of the two
+# standards the ECU implements. Using someone else's implementation as the
+# tester is the point: agreement with it is evidence of interoperability.
+can-isotp>=2.0.0        # ISO 15765-2 transport
+udsoncan>=1.23.0        # ISO 14229-1 UDS client
+
+# Optional - only needed on a machine with no C compiler (typically Windows),
+# to build the unit tests and the SIL library. A self-contained clang, installed
+# into the Python environment; nothing is added to the system.
+#   pip install ziglang
