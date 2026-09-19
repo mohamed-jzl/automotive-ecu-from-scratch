@@ -90,12 +90,13 @@ all: test
 
 build: $(EXES)
 
-$(BUILD):
-	@mkdir -p $(BUILD)
-
-# Static pattern rule: build each suite from its test file, its production
-# source, and the framework.
-$(BUILD)/%: %.c $(FRAMEWORK) | $(BUILD)
+# The output directory is created by the recipe itself ($(@D) is the target's
+# directory). It is deliberately NOT a prerequisite: the directory is called
+# "build" and so is the phony "compile only" target above, so making one depend
+# on the other gives make a circular dependency, which it resolves by silently
+# dropping it - leaving the linker with nowhere to write its output.
+$(BUILD)/%: %.c $(FRAMEWORK)
+	@mkdir -p $(@D)
 	@echo "  CC    $@"
 	@$(CC) $(CFLAGS) -o $@ $< $(SRC_$*) $(FRAMEWORK)
 

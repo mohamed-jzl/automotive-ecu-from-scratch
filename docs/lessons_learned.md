@@ -328,7 +328,43 @@ be replayed forever. The fix mixes the millisecond timestamp of each seed
 request into the generator. It is still not cryptography, and the
 documentation says so, but it removes an attack that needed no skill at all.
 
-### 5.8 Testing against someone else's implementation
+### 5.8 The first CI run failed - on the build system, not the code
+
+**Symptom.** The very first CI run after pushing v0.2: four jobs green
+(firmware build, SIL diagnostics, test framework, static analysis), one red.
+`cd tests && make` exited with code 2:
+
+```
+make: Circular build <- build/test_vehicle_state_machine dependency dropped.
+/usr/bin/ld: cannot open output file build/test_fault_manager: No such file or directory
+```
+
+**Cause.** The Makefile used the name `build` for two different things: a
+phony target meaning "compile but do not run", and the output *directory* that
+every executable needs. Each executable therefore had `build` as an
+order-only prerequisite, while `build` depended on every executable. Make
+detected the cycle, broke it by dropping the directory dependency, and the
+linker had nowhere to write.
+
+The fix is to create the directory inside the recipe (`mkdir -p $(@D)`)
+instead of making it a prerequisite.
+
+**Why it was not caught earlier.** Every local run used
+`tools/run_unit_tests.py`, which needs no make. The Makefile had been checked
+by reading it, not by running it - on Windows there was no `make` to run it
+with. Reproducing meant installing gcc and make inside WSL and running exactly
+what CI runs.
+
+**Lesson.** This is section 5.2 all over again, and it is worth noticing that
+it repeated: *a build path nobody executes is a build path that does not
+work*. There are now two ways to run the tests, and both are exercised - the
+Python runner locally, the Makefile in CI.
+
+It is also a good result in its own right: the pipeline caught a real defect on
+its first run, which is exactly what it exists for. Four green jobs and one
+red is far more informative than a green badge nobody has tested.
+
+### 5.9 Testing against someone else's implementation
 
 The UDS tester is not hand-written: it is udsoncan and can-isotp, maintained
 by other people and used widely. That was deliberate. A client written by the
