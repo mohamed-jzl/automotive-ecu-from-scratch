@@ -258,4 +258,4 @@ system testing with an independent tester · requirements traceability · CI
 ---
 
 MIT licence — see [LICENSE](LICENSE).
-**Mohamed Amine Jazoul** — Electrical Engineering, ENSAM Rabat
+**Mohamed Amine Jazoul** — Electrical Engineering Student
